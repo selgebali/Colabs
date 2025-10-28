@@ -1,6 +1,9 @@
+import math
 import os
+import time
+import urllib.parse
 import textwrap
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import networkx as nx
 import numpy as np
@@ -9,178 +12,257 @@ import plotly.graph_objs as go
 import plotly.io as pio
 import requests
 
-# Custom color palette
-custom_colors = {
-    "Resource": "#243B54",
-    "Creator": "#00B1E2",
-    "Contributor": "#5B88B9",
-    "Publisher": "#46BCAB",
+# ============================================================
+# CONFIGURATION
+# ============================================================
+CLIENT_ID = "ZBW.ZBW-JDA"
+PAGE_SIZE = 10
+MAX_ITEMS = 10
+
+HTML_FILE = "merged_knowledge_graphs.html"
+NODES_CSV = "merged_nodes.csv"
+EDGES_CSV = "merged_edges.csv"
+
+TIMEOUT = 10
+RETRY = 3
+SLEEP_BETWEEN_CALLS = 0.25
+
+FIG_W = 1000
+FIG_H = 900
+
+RADIUS = 1.8          # circle radius for related nodes (controls edge length)
+CURVATURE = 0.22      # base curvature for edges (0 = straight line)
+CURVE_JITTER = 0.06   # small +/- added to curvature to reduce overlaps
+EDGE_SAMPLES = 80     # points per edge curve
+EDGE_WIDTH = 2
+EDGE_COLOR = "#888"
+LABEL_OFFSET = 0.08
+
+custom_colors: Dict[str, str] = {
+    "Central": "#243B54",
     "RelatedItem": "#90D7CD",
+    "Fallback": "#7f7f7f",
 }
 
 
-# Helper function to wrap text
-def wrap_text(text: str, width: int = 20) -> str:
+# ============================================================
+# UTILS: text wrapping, safe requests, small helpers
+# ============================================================
+
+def wrap_text(text: str, width: int = 24) -> str:
+    """Wrap long labels for nicer Plotly rendering."""
     return "<br>".join(textwrap.wrap(text, width=width))
 
 
-# Function to fetch data from the API endpoint using a client filter
-def fetch_api_data(url: str, limit: int = 100) -> List[Dict[str, Any]]:
-    response = requests.get(url)
-    response.raise_for_status()
-    data = response.json()
-    resources = parse_resources(data.get("data", []))
-    total_resources = data.get("meta", {}).get("total", "Unknown")
-    print(f"Total number of resources available: {total_resources}")
-    return resources[:limit]
+def safe_get(url: str, timeout: int = TIMEOUT, retry: int = RETRY) -> requests.Response:
+    """
+    GET with simple retries and a short backoff.
+    Raises the last exception if all retries fail.
+    """
+    last_err: Optional[Exception] = None
+    for _ in range(retry):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if 200 <= resp.status_code < 300:
+                return resp
+            last_err = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+        except Exception as exc:  # noqa: BLE001 - simple retry loop
+            last_err = exc
+        time.sleep(SLEEP_BETWEEN_CALLS)
+    if last_err:
+        raise last_err
+    raise RuntimeError("safe_get failed unexpectedly without an error object")
 
 
-# Function to parse resources
-def parse_resources(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    resources = []
-    for item in data:
-        attributes = item.get("attributes", {})
-        types = attributes.get("types", {})
+def url_for_related_doi(doi: str) -> str:
+    """
+    DataCite endpoint for a single DOI resource.
+    DOI must be URL-encoded (slashes included).
+    """
+    encoded = urllib.parse.quote(doi, safe="")
+    return f"https://api.datacite.org/dois/{encoded}"
 
-        resource_data = {
-            "doi": attributes.get("doi", "No DOI available"),
-            "resourceTypeGeneral": types.get("resourceTypeGeneral", "No resourceTypeGeneral available"),
-            "resourceType": types.get("resourceType", "No resource type available"),
-            "schemaOrg": types.get("schemaOrg", "No schemaOrg available"),
-            "creators": [],
-            "contributors": [],
-            "publishers": attributes.get("publisher", "No publisher information"),
-            "relatedItems": [],
-        }
 
-        # Add creators
-        for creator in attributes.get("creators", []):
-            identifiers = creator.get("nameIdentifiers") or []
-            identifier = identifiers[0].get("nameIdentifier") if identifiers else "No identifier"
-            resource_data["creators"].append(
-                {
-                    "name": creator.get("name", "No name available"),
-                    "identifier": identifier,
-                }
+def normalize_string(value: Optional[str]) -> str:
+    """None-safe strip."""
+    return (value or "").strip()
+
+
+# ============================================================
+# SORTING: prioritize DOIs with the most related identifiers
+# ============================================================
+
+def sort_items_by_related_count(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Sort API items in descending order by number of relatedIdentifiers."""
+
+    def related_count(it: Dict[str, Any]) -> int:
+        attributes = it.get("attributes", {}) or {}
+        return len(attributes.get("relatedIdentifiers") or [])
+
+    return sorted(items, key=related_count, reverse=True)
+
+
+# ============================================================
+# DATA HELPERS
+# ============================================================
+
+def resolve_related_target(related: Dict[str, Any]) -> Tuple[str, str, str]:
+    """
+    Build a display label for a related identifier and optionally enrich with DOI data.
+
+    Returns:
+        Tuple of (display_label, target_type_general, title)
+    """
+    identifier = normalize_string(related.get("relatedIdentifier"))
+    identifier_type = normalize_string(related.get("relatedIdentifierType"))
+    target_type_general = ""
+    title = ""
+
+    if identifier_type.upper() == "DOI" and identifier:
+        try:
+            response = safe_get(url_for_related_doi(identifier))
+            data = response.json().get("data") or {}
+            attributes = data.get("attributes", {}) or {}
+            target_type_general = normalize_string(
+                (attributes.get("types") or {}).get("resourceTypeGeneral")
             )
+            titles = attributes.get("titles") or []
+            title = normalize_string(titles[0].get("title")) if titles else ""
+            if title:
+                label = f"{title}\n{identifier}"
+            else:
+                label = f"DOI: {identifier}"
+        except Exception:
+            label = f"DOI: {identifier}"
+    else:
+        human_readable_type = identifier_type or "Identifier"
+        label = f"{human_readable_type}: {identifier or 'Unknown'}"
 
-        # Add contributors
-        for contributor in attributes.get("contributors", []):
-            identifiers = contributor.get("nameIdentifiers") or []
-            identifier = identifiers[0].get("nameIdentifier") if identifiers else "No identifier"
-            resource_data["contributors"].append(
-                {
-                    "name": contributor.get("name", "No name available"),
-                    "type": contributor.get("contributorType", "No type available"),
-                    "identifier": identifier,
-                }
-            )
-
-        # Add related items
-        for related in attributes.get("relatedIdentifiers", []):
-            resource_data["relatedItems"].append(
-                {
-                    "identifier": related.get("relatedIdentifier", "No identifier available"),
-                    "relationType": related.get("relationType", "No relation type available"),
-                }
-            )
-
-        resources.append(resource_data)
-    return resources
+    return wrap_text(label, width=24), target_type_general, title
 
 
-# Function to append DataFrame content to CSV (create header on first write)
 def append_df_to_csv(df: pd.DataFrame, path: str) -> None:
+    """Append DataFrame content to CSV (create header on first write)."""
     df.to_csv(path, mode="a", index=False, header=not os.path.exists(path), encoding="utf-8")
 
 
-# Function to visualize the resource network and append results
-def visualize_resource_plotly(resource: Dict[str, Any], html_file: str, nodes_csv: str, edges_csv: str) -> None:
-    G = nx.Graph()
+# ============================================================
+# VIZ HELPERS: radial layout and quadratic Bézier curves
+# ============================================================
 
-    # Define node size map
-    node_size_map = {
-        "Resource": 300,
-        "Creator": 200,
-        "Contributor": 200,
-        "Publisher": 200,
-        "RelatedItem": 200,
-    }
+def radial_layout(
+    graph: nx.Graph, center_node: str, radius: float = RADIUS
+) -> Dict[str, Tuple[float, float]]:
+    """Place center at (0,0) and others on a circle -> uniform edge lengths/clarity."""
+    nodes = [n for n in graph.nodes() if n != center_node]
+    if not nodes:
+        return {center_node: (0.0, 0.0)}
+    angles = np.linspace(0, 2 * np.pi, len(nodes), endpoint=False)
+    pos: Dict[str, Tuple[float, float]] = {center_node: (0.0, 0.0)}
+    for node, theta in zip(nodes, angles):
+        pos[node] = (radius * np.cos(theta), radius * np.sin(theta))
+    return pos
 
-    resource_type_general = resource.get("resourceTypeGeneral", "No resourceTypeGeneral available")
-    central_node_info = f"{resource_type_general}\nDOI: {resource['doi']}"
-    resource_node_label = wrap_text(central_node_info, width=20)
-    G.add_node(
-        resource_node_label,
-        label="Resource",
-        size=node_size_map.get("Resource", 80),
-        color=custom_colors.get("Resource", "#7f7f7f"),
+
+def quad_bezier_curve(
+    p0: Tuple[float, float],
+    p1: Tuple[float, float],
+    bend: float = CURVATURE,
+    samples: int = EDGE_SAMPLES,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Quadratic Bézier between p0 and p1.
+    Control point is offset perpendicular to the segment by 'bend' * distance.
+    """
+    x0, y0 = p0
+    x1, y1 = p1
+
+    mx, my = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    dx, dy = (x1 - x0), (y1 - y0)
+    length = math.hypot(dx, dy) or 1.0
+    perp_x, perp_y = -dy / length, dx / length
+
+    cx = mx + bend * length * perp_x
+    cy = my + bend * length * perp_y
+
+    t = np.linspace(0, 1, samples)
+    x_vals = (1 - t) ** 2 * x0 + 2 * (1 - t) * t * cx + t**2 * x1
+    y_vals = (1 - t) ** 2 * y0 + 2 * (1 - t) * t * cy + t**2 * y1
+    return x_vals, y_vals
+
+
+# ============================================================
+# VIZ: build a per-DOI knowledge graph (central + related items)
+# ============================================================
+
+def visualize_item(
+    item: Dict[str, Any],
+    html_file: str = HTML_FILE,
+    nodes_csv: str = NODES_CSV,
+    edges_csv: str = EDGES_CSV,
+) -> None:
+    """
+    Render one DOI as a star/radial graph:
+      - central node = DOI
+      - ring nodes   = related identifiers (optionally enriched by resolving DOIs)
+    """
+    attributes = item.get("attributes", {}) or {}
+    doi = normalize_string(attributes.get("doi")) or "Unknown DOI"
+    related_identifiers = attributes.get("relatedIdentifiers") or []
+
+    graph: nx.Graph = nx.Graph()
+
+    node_size_map = {"Central": 320, "RelatedItem": 200}
+
+    central_info = wrap_text(f"DOI: {doi}\nRelated IDs: {len(related_identifiers)}", width=24)
+    graph.add_node(
+        central_info,
+        label="Central",
+        size=node_size_map["Central"],
+        color=custom_colors.get("Central", custom_colors["Fallback"]),
     )
 
-    # Add creators
-    for creator in resource["creators"]:
-        creator_info = f"Creator: {creator['name']}\nID: {creator['identifier']}"
-        creator_label = wrap_text(creator_info, width=20)
-        G.add_node(
-            creator_label,
-            label="Creator",
-            size=node_size_map.get("Creator", 60),
-            color=custom_colors.get("Creator", "#7f7f7f"),
-        )
-        G.add_edge(resource_node_label, creator_label)
-
-    # Add contributors
-    for contributor in resource["contributors"]:
-        contributor_label = wrap_text(
-            f"Contributor: {contributor['name']}\n {contributor['identifier']}", width=20
-        )
-        G.add_node(
-            contributor_label,
-            label="Contributor",
-            size=node_size_map.get("Contributor", 60),
-            color=custom_colors.get("Contributor", "#7f7f7f"),
-        )
-        G.add_edge(resource_node_label, contributor_label)
-
-    # Add publisher
-    publisher_label = wrap_text(f"Publisher: {resource['publishers']}", width=20)
-    G.add_node(
-        publisher_label,
-        label="Publisher",
-        size=node_size_map.get("Publisher", 60),
-        color=custom_colors.get("Publisher", "#7f7f7f"),
-    )
-    G.add_edge(resource_node_label, publisher_label)
-
-    # Add related items
-    for item in resource["relatedItems"]:
-        item_node_label = wrap_text(f"{item['relationType']}: {item['identifier']}", width=20)
-        G.add_node(
-            item_node_label,
+    for related in related_identifiers:
+        display_label, target_type_general, title = resolve_related_target(related)
+        graph.add_node(
+            display_label,
             label="RelatedItem",
-            size=node_size_map.get("RelatedItem", 60),
-            color=custom_colors.get("RelatedItem", "#7f7f7f"),
+            size=node_size_map["RelatedItem"],
+            color=custom_colors.get("RelatedItem", custom_colors["Fallback"]),
         )
-        G.add_edge(resource_node_label, item_node_label)
 
-    # Define node positions using circular layout for better spacing
-    pos = nx.circular_layout(G)
+        relation_type = normalize_string(related.get("relationType"))
+        identifier_type = normalize_string(related.get("relatedIdentifierType"))
 
-    # Extract node properties
-    node_x = [pos[node][0] for node in G.nodes]
-    node_y = [pos[node][1] for node in G.nodes]
-    node_size = [G.nodes[node]["size"] for node in G.nodes]
-    node_color = [G.nodes[node]["color"] for node in G.nodes]
-    node_text = list(G.nodes)
-    node_hovertext = list(G.nodes)
+        graph.add_edge(
+            central_info,
+            display_label,
+            relationType=relation_type,
+            identifierType=identifier_type,
+            targetTypeGeneral=target_type_general,
+            title=title,
+        )
 
-    # Create node traces with text labels
+        if identifier_type.upper() == "DOI":
+            time.sleep(SLEEP_BETWEEN_CALLS)
+
+    for u, v in graph.edges():
+        graph.edges[u, v]["weight"] = 0.1
+
+    positions = radial_layout(graph, central_info, radius=RADIUS)
+
+    node_x = [positions[node][0] for node in graph.nodes()]
+    node_y = [positions[node][1] for node in graph.nodes()]
+    node_size = [graph.nodes[node]["size"] for node in graph.nodes()]
+    node_color = [graph.nodes[node]["color"] for node in graph.nodes()]
+    node_text = list(graph.nodes())
+
     node_trace = go.Scatter(
         x=node_x,
         y=node_y,
         mode="markers+text",
         text=node_text,
-        hovertext=node_hovertext,
+        hovertext=node_text,
         hoverinfo="text",
         marker=dict(
             showscale=False,
@@ -190,95 +272,167 @@ def visualize_resource_plotly(resource: Dict[str, Any], html_file: str, nodes_cs
             opacity=1.0,
         ),
         textposition="middle center",
-        textfont=dict(size=12, family="Arial", color="white", weight="bold"),
+        textfont=dict(size=12, family="Arial", color="white"),
     )
 
-    # Create edge traces with curved lines
-    edge_traces = []
-    for edge in G.edges():
-        x0, y0 = pos[edge[0]]
-        x1, y1 = pos[edge[1]]
+    edge_traces: List[go.Scatter] = []
+    annotations: List[Dict[str, Any]] = []
 
-        width = 2  # default edge width
+    sign = 1
+    for source, target in graph.edges():
+        p0, p1 = positions[source], positions[target]
+        jitter = CURVE_JITTER if sign > 0 else -CURVE_JITTER
+        bend = sign * (CURVATURE + jitter)
+        sign *= -1
 
-        # Generate slight curve for edges (using quadratic Bézier curve approximation)
-        t = np.linspace(0, 1, 100)
-        x_mid = (x0 + x1) / 2
-        y_mid = (y0 + y1) / 2 + 0.1  # Adjust for curvature
-        x_values = (1 - t) ** 2 * x0 + 2 * (1 - t) * t * x_mid + t**2 * x1
-        y_values = (1 - t) ** 2 * y0 + 2 * (1 - t) * t * y_mid + t**2 * y1
+        x_vals, y_vals = quad_bezier_curve(p0, p1, bend=bend, samples=EDGE_SAMPLES)
 
-        edge_trace = go.Scatter(
-            x=x_values,
-            y=y_values,
-            line=dict(width=width, color="#888"),
-            hoverinfo="none",
-            mode="lines",
+        relation_type = graph.edges[source, target].get("relationType", "")
+        identifier_type = graph.edges[source, target].get("identifierType", "")
+        target_type_general = graph.edges[source, target].get("targetTypeGeneral", "")
+
+        hover_text = (
+            f"relationType: {relation_type}<br>"
+            f"identifierType: {identifier_type}<br>"
+            f"target RTG: {target_type_general}"
         )
-        edge_traces.append(edge_trace)
 
-    fig = go.Figure(
+        edge_traces.append(
+            go.Scatter(
+                x=x_vals,
+                y=y_vals,
+                mode="lines",
+                line=dict(width=EDGE_WIDTH, color=EDGE_COLOR),
+                hoverinfo="text",
+                text=[hover_text] * len(x_vals),
+            )
+        )
+
+        mid_index = len(x_vals) // 2
+        dx = x_vals[min(mid_index + 1, len(x_vals) - 1)] - x_vals[max(mid_index - 1, 0)]
+        dy = y_vals[min(mid_index + 1, len(y_vals) - 1)] - y_vals[max(mid_index - 1, 0)]
+        angle = math.degrees(math.atan2(dy, dx))
+
+        length = math.hypot(dx, dy) or 1.0
+        normal_x, normal_y = -dy / length, dx / length
+
+        label_x = x_vals[mid_index] + LABEL_OFFSET * normal_x
+        label_y = y_vals[mid_index] + LABEL_OFFSET * normal_y
+
+        if relation_type:
+            annotations.append(
+                dict(
+                    x=label_x,
+                    y=label_y,
+                    xref="x",
+                    yref="y",
+                    text=relation_type,
+                    showarrow=False,
+                    align="center",
+                    textangle=angle,
+                    font=dict(size=12, family="Arial", color="#111"),
+                    bgcolor="rgba(255,255,255,0.9)",
+                    bordercolor="rgba(0,0,0,0.2)",
+                    borderwidth=1,
+                    borderpad=2,
+                    opacity=1,
+                    captureevents=False,
+                )
+            )
+
+    figure = go.Figure(
         data=edge_traces + [node_trace],
         layout=go.Layout(
-            title=dict(
-                text=f"Knowledge Graph of {resource['doi']}",
-                font=dict(size=20),
-                x=0.5,
-                y=0.98,
-                xanchor="center",
-                yanchor="top",
-            ),
+            title=dict(text=f"Related Identifiers Graph — {doi}", x=0.5),
             showlegend=False,
             hovermode="closest",
-            margin=dict(b=20, l=5, r=5, t=40),
+            margin=dict(b=20, l=20, r=20, t=50),
             xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
             yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-            width=1000,
-            height=1000,
+            width=FIG_W,
+            height=FIG_H,
             plot_bgcolor="rgba(0,0,0,0)",
             paper_bgcolor="rgba(0,0,0,0)",
+            annotations=annotations,
         ),
     )
-    fig.show()
 
-    with open(html_file, "a", encoding="utf-8") as f:
-        f.write(pio.to_html(fig, include_plotlyjs="cdn"))
+    figure.show()
 
-    node_data = [
+    with open(html_file, "a", encoding="utf-8") as handle:
+        handle.write(pio.to_html(figure, include_plotlyjs="cdn"))
+
+    node_rows = [
         {
             "Node": node,
-            "Label": G.nodes[node]["label"],
-            "Size": G.nodes[node]["size"],
-            "Color": G.nodes[node]["color"],
+            "Label": graph.nodes[node]["label"],
+            "Color": graph.nodes[node]["color"],
+            "Size": graph.nodes[node]["size"],
         }
-        for node in G.nodes()
+        for node in graph.nodes()
     ]
-    nodes_df = pd.DataFrame(node_data)
-    append_df_to_csv(nodes_df, nodes_csv)
+    append_df_to_csv(pd.DataFrame(node_rows), nodes_csv)
 
-    edge_data = [{"Source": edge[0], "Target": edge[1]} for edge in G.edges()]
-    edges_df = pd.DataFrame(edge_data)
-    append_df_to_csv(edges_df, edges_csv)
+    edge_rows = [
+        {
+            "Source": source,
+            "Target": target,
+            "relationType": graph.edges[source, target].get("relationType", ""),
+            "identifierType": graph.edges[source, target].get("identifierType", ""),
+            "targetTypeGeneral": graph.edges[source, target].get("targetTypeGeneral", ""),
+            "title": graph.edges[source, target].get("title", ""),
+        }
+        for source, target in graph.edges()
+    ]
+    append_df_to_csv(pd.DataFrame(edge_rows), edges_csv)
+
+
+# ============================================================
+# API FETCHING
+# ============================================================
+
+def fetch_items_for_client(
+    client_id: str,
+    page_size: int = PAGE_SIZE,
+    limit: Optional[int] = MAX_ITEMS,
+) -> List[Dict[str, Any]]:
+    """Fetch DOIs for a client and sort them by related identifier counts."""
+    url = f"https://api.datacite.org/dois?client-id={client_id}&page[size]={page_size}"
+    response = safe_get(url)
+    payload = response.json()
+    items = payload.get("data") or []
+    total = payload.get("meta", {}).get("total")
+    print(f"Total number of resources available: {total}")
+
+    sorted_items = sort_items_by_related_count(items)
+    if limit is not None:
+        return sorted_items[:limit]
+    return sorted_items
+
+
+# ============================================================
+# MAIN EXECUTION
+# ============================================================
+
+def main() -> None:
+    for path in (HTML_FILE, NODES_CSV, EDGES_CSV):
+        if os.path.exists(path):
+            os.remove(path)
+
+    with open(HTML_FILE, "w", encoding="utf-8") as handle:
+        handle.write("<html><head><title>Knowledge Graphs</title></head><body>")
+
+    items = fetch_items_for_client(CLIENT_ID, page_size=PAGE_SIZE, limit=MAX_ITEMS)
+    for item in items:
+        visualize_item(item)
+
+    with open(HTML_FILE, "a", encoding="utf-8") as handle:
+        handle.write("</body></html>")
+
+    print(
+        f"Graphs saved in {HTML_FILE}, nodes in {NODES_CSV}, and edges in {EDGES_CSV}"
+    )
 
 
 if __name__ == "__main__":
-    client_id = "ZBW.ZBW-JDA"
-    api_url = f"https://api.datacite.org/dois?client-id={client_id}&page[size]=10"
-
-    html_file = "merged_knowledge_graphs.html"
-    nodes_csv = "merged_nodes.csv"
-    edges_csv = "merged_edges.csv"
-
-    with open(html_file, "w", encoding="utf-8") as f:
-        f.write("<html><head><title>Knowledge Graphs</title></head><body>")
-
-    resources = fetch_api_data(api_url)
-    for resource in resources:
-        visualize_resource_plotly(resource, html_file, nodes_csv, edges_csv)
-
-    with open(html_file, "a", encoding="utf-8") as f:
-        f.write("</body></html>")
-
-    print(
-        f"Graphs saved in {html_file}, nodes in {nodes_csv}, and edges in {edges_csv}"
-    )
+    main()
