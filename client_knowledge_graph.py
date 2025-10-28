@@ -30,7 +30,7 @@ SLEEP_BETWEEN_CALLS = 0.25
 FIG_W = 1000
 FIG_H = 900
 
-RADIUS = 1.8          # circle radius for related nodes (controls edge length)
+RADIUS = 3.0          # circle radius for related nodes (controls edge length)
 CURVATURE = 0.22      # base curvature for edges (0 = straight line)
 CURVE_JITTER = 0.06   # small +/- added to curvature to reduce overlaps
 EDGE_SAMPLES = 80     # points per edge curve
@@ -311,7 +311,7 @@ def visualize_item(
         mid_index = len(x_vals) // 2
         dx = x_vals[min(mid_index + 1, len(x_vals) - 1)] - x_vals[max(mid_index - 1, 0)]
         dy = y_vals[min(mid_index + 1, len(y_vals) - 1)] - y_vals[max(mid_index - 1, 0)]
-        angle = math.degrees(math.atan2(dy, dx))
+        angle = 0
 
         length = math.hypot(dx, dy) or 1.0
         normal_x, normal_y = -dy / length, dx / length
